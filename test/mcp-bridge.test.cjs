@@ -248,6 +248,7 @@ describe('Bridge discovery', () => {
     });
 
     const statOverrides = new Map();
+    statOverrides.set(ownedConnFile, { uid: currentUid });
     statOverrides.set(foreignConnFile, { uid: currentUid + 1 });
 
     const connInfo = readConnectionInfo({
