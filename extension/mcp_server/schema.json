@@ -14,7 +14,7 @@
         "name": "getServerInfo",
         "type": "function",
         "async": true,
-        "description": "Get current server status, port, and connection file path",
+        "description": "Get current server status, port, connection file path, build information, and lastError (the last startup error message, or null before a failure or after a successful start). Available only to the extension, not over MCP.",
         "parameters": []
       },
       {
@@ -49,6 +49,11 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "Array of tool names to disable. Empty array means all tools enabled."
+          },
+          {
+            "name": "getMessagesLimit",
+            "type": "number",
+            "description": "Maximum number of messages getMessages may read in one call. Must be an integer from 1 to 20."
           }
         ]
       },
@@ -70,19 +75,69 @@
         "name": "getBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Get whether skipReview is blocked by user preference",
+        "description": "Get the Block skipReview preference. It defaults to true, gates direct mail sends and event/task creation without review, blocks adding attendees, and makes meetings with other attendees read-only through MCP.",
         "parameters": []
       },
       {
         "name": "setBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Set whether skipReview is blocked by user preference",
+        "description": "Set whether skipReview and adding calendar attendees are blocked, and meetings with other attendees are read-only through MCP. Defaults to true; explicitly set false to permit these writes.",
         "parameters": [
           {
             "name": "blockSkipReview",
             "type": "boolean",
-            "description": "When true, send/reply/forward tools reject skipReview=true and require the review window."
+            "description": "When true (the default), sendMail, replyToMessage, forwardMessage, createEvent, and createTask reject skipReview=true. Adding event attendees is blocked; updateEvent and deleteEvent reject all writes to events with attendees other than the calendar user, including series/occurrence updates and deletions with attendees omitted, because calendar servers can email invitations, updates, or cancellations without review. Set false explicitly to permit these actions."
+          }
+        ]
+      },
+      {
+        "name": "getAllowFilterSendActions",
+        "type": "function",
+        "async": true,
+        "description": "Get whether MCP may create, update, or manually run filters with automatic Forward/Reply actions. Defaults to false; this setting is independent of Block skipReview.",
+        "parameters": []
+      },
+      {
+        "name": "setAllowFilterSendActions",
+        "type": "function",
+        "async": true,
+        "description": "Set the user-only permission for automatic Forward/Reply filter actions. Turning it off does not disable saved Thunderbird filters.",
+        "parameters": [
+          {
+            "name": "allowFilterSendActions",
+            "type": "boolean",
+            "description": "Set true explicitly to allow MCP to create, update, and manually run filters that send without a compose review window. Defaults to false; disabling or deleting a sending rule remains available. Custom add-on actions remain unsupported."
+          }
+        ]
+      },
+      {
+        "name": "getPrivacySettings",
+        "type": "function",
+        "async": true,
+        "description": "Get user-only encrypted message, calendar, and address-book access preferences. All default to false.",
+        "parameters": []
+      },
+      {
+        "name": "setPrivacySettings",
+        "type": "function",
+        "async": true,
+        "description": "Set privacy preferences from the options page. These settings are not exposed as MCP tools.",
+        "parameters": [
+          {
+            "name": "allowEncryptedMessages",
+            "type": "boolean",
+            "description": "Allow MCP clients to receive decrypted message content. Defaults to false; local S/MIME decryption may still occur while content is withheld."
+          },
+          {
+            "name": "allowAllCalendars",
+            "type": "boolean",
+            "description": "Allow all calendars when mail account restrictions are active. Defaults to false."
+          },
+          {
+            "name": "allowAllAddressBooks",
+            "type": "boolean",
+            "description": "Allow all address books when mail account restrictions are active. Defaults to false."
           }
         ]
       },
@@ -112,6 +167,26 @@
         "async": true,
         "description": "Generate a fresh auth token string",
         "parameters": []
+      },
+      {
+        "name": "getListenAll",
+        "type": "function",
+        "async": true,
+        "description": "Get whether the server listens on all network interfaces",
+        "parameters": []
+      },
+      {
+        "name": "setListenAll",
+        "type": "function",
+        "async": true,
+        "description": "Set whether the server listens on all network interfaces. When enabled, the server is accessible from other machines on your network (e.g. WSL, Docker) over plain HTTP. Warning: the authentication token and mail content travel in clear text on the LAN.",
+        "parameters": [
+          {
+            "name": "listenAll",
+            "type": "boolean",
+            "description": "When true, server binds to 0.0.0.0 instead of 127.0.0.1. Server will be restarted."
+          }
+        ]
       }
     ]
   }

@@ -1,4 +1,6 @@
-/* global browser */
+// `browser` is declared as a global in eslint.config.mjs for the
+// extension/ file group. Per-file /* global browser */ triggered
+// no-redeclare.
 "use strict";
 
 const statusDot = document.getElementById("statusDot");
@@ -24,15 +26,50 @@ const generateStableAuthTokenBtn = document.getElementById("generateStableAuthTo
 const regenerateStableAuthTokenBtn = document.getElementById("regenerateStableAuthTokenBtn");
 const stableAuthTokenStatus = document.getElementById("stableAuthTokenStatus");
 
+// BEGIN OPTIONS ACCESS STATE
 let currentAccounts = [];
 let currentTools = [];
+let getMessagesLimitInput = null;
+let getMessagesLimitStatus = null;
+let currentAccountError = "";
+let accountAccessChanged = false;
+let currentToolError = "";
+let currentGetMessagesLimit = "";
+let toolAccessChanged = false;
+let toolSettingsChanged = false;
 
 // CRUD labels for sub-group headers
 const CRUD_LABELS = { read: "Read", create: "Create", update: "Update", delete: "Delete" };
 
+function validateGetMessagesLimitInput() {
+  if (!getMessagesLimitInput) return undefined;
+  const min = Number(getMessagesLimitInput.dataset.min || "1");
+  const max = Number(getMessagesLimitInput.dataset.max || "20");
+  const rawValue = getMessagesLimitInput.value.trim();
+  const value = Number(rawValue);
+  const valid = /^\d+$/.test(rawValue) && Number.isInteger(value) && value >= min && value <= max;
+  if (!valid) {
+    getMessagesLimitInput.setAttribute("aria-invalid", "true");
+    if (getMessagesLimitStatus) {
+      getMessagesLimitStatus.textContent = `Enter an integer from ${min} to ${max}.`;
+    }
+    return null;
+  }
+  getMessagesLimitInput.removeAttribute("aria-invalid");
+  if (getMessagesLimitStatus) {
+    getMessagesLimitStatus.textContent = "";
+  }
+  return value;
+}
+// END OPTIONS ACCESS STATE
+
+// BEGIN OPTIONS SERVER STATUS
+const retryServerBtn = document.getElementById("retryServerBtn");
+
 async function loadServerInfo() {
   try {
     const info = await browser.mcpServer.getServerInfo();
+    retryServerBtn.hidden = info.running || !info.lastError;
     if (info.running) {
       statusDot.className = "status-dot running";
       statusText.textContent = "Running";
@@ -40,7 +77,7 @@ async function loadServerInfo() {
       connFile.textContent = info.connectionFile || "--";
     } else {
       statusDot.className = "status-dot stopped";
-      statusText.textContent = "Not running";
+      statusText.textContent = info.lastError ? "Failed to start: " + info.lastError : "Not running";
       serverPort.textContent = "--";
       connFile.textContent = "--";
     }
@@ -69,8 +106,26 @@ async function loadServerInfo() {
   } catch (e) {
     statusDot.className = "status-dot stopped";
     statusText.textContent = "Error: " + e.message;
+    serverPort.textContent = "--";
+    connFile.textContent = "--";
   }
 }
+
+retryServerBtn.addEventListener("click", async () => {
+  retryServerBtn.disabled = true;
+  statusText.textContent = "Starting...";
+  try {
+    const result = await browser.mcpServer.start();
+    await loadServerInfo();
+    if (result.success) await loadAuthenticationConfig();
+  } catch (e) {
+    statusDot.className = "status-dot stopped";
+    statusText.textContent = "Failed to start: " + e.message;
+  } finally {
+    retryServerBtn.disabled = false;
+  }
+});
+// END OPTIONS SERVER STATUS
 
 function updateStableAuthTokenControls() {
   stableAuthTokenControls.hidden = !useStableAuthTokenCheckbox.checked;
@@ -205,10 +260,18 @@ regenerateStableAuthTokenBtn.addEventListener("click", async () => {
   await generateAndStoreStableAuthToken("Regenerated and saved.");
 });
 
+// BEGIN OPTIONS ACCOUNT ACCESS
 async function loadAccountAccess() {
+  saveBtn.disabled = true;
+  accountAccessChanged = false;
   try {
     const data = await browser.mcpServer.getAccountAccessConfig();
     currentAccounts = data.accounts || [];
+    currentAccountError = data.mode === "error"
+      ? (data.error || "Invalid account access configuration.") + " Access is blocked. Select allowed accounts and save to replace this setting."
+      : "";
+    saveStatus.textContent = currentAccountError;
+    saveStatus.className = currentAccountError ? "save-status error" : "save-status";
 
     if (currentAccounts.length === 0) {
       accountList.innerHTML = "<li>No accounts found.</li>";
@@ -238,9 +301,6 @@ async function loadAccountAccess() {
       li.appendChild(label);
       accountList.appendChild(li);
     }
-
-    saveBtn.disabled = false;
-    saveStatus.textContent = "";
   } catch (e) {
     accountList.innerHTML = "";
     const li = document.createElement("li");
@@ -250,10 +310,17 @@ async function loadAccountAccess() {
 }
 
 function onAccountChange() {
-  saveStatus.textContent = "";
+  const checkboxes = accountList.querySelectorAll('input[type="checkbox"]');
+  accountAccessChanged = [...checkboxes].some(cb =>
+    cb.checked !== !!currentAccounts.find(acct => acct.id === cb.value)?.allowed
+  );
+  saveBtn.disabled = !accountAccessChanged;
+  saveStatus.textContent = currentAccountError;
+  saveStatus.className = currentAccountError ? "save-status error" : "save-status";
 }
 
 saveBtn.addEventListener("click", async () => {
+  if (!accountAccessChanged) return;
   saveBtn.disabled = true;
   saveStatus.textContent = "";
   saveStatus.className = "save-status";
@@ -267,6 +334,13 @@ saveBtn.addEventListener("click", async () => {
     } else {
       allChecked = false;
     }
+  }
+
+  if (checked.length === 0) {
+    saveStatus.textContent = "Select at least one account. The existing access setting has not changed.";
+    saveStatus.className = "save-status error";
+    saveBtn.disabled = false;
+    return;
   }
 
   // If all are checked, send empty array (= allow all)
@@ -286,14 +360,24 @@ saveBtn.addEventListener("click", async () => {
     saveStatus.textContent = "Error: " + e.message;
     saveStatus.className = "save-status error";
   }
-  saveBtn.disabled = false;
+  saveBtn.disabled = !accountAccessChanged;
 });
+// END OPTIONS ACCOUNT ACCESS
 
+// BEGIN OPTIONS TOOL ACCESS
 async function loadToolAccess() {
+  saveToolsBtn.disabled = true;
+  toolAccessChanged = false;
+  toolSettingsChanged = false;
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
     currentTools = data.tools || [];
     const groupLabels = data.groups || {};
+    currentToolError = data.mode === "error"
+      ? (data.error || "Invalid tool access configuration.") + " Optional tools are blocked. Change tool access and save to replace this setting."
+      : "";
+    saveToolsStatus.textContent = currentToolError;
+    saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
 
     if (currentTools.length === 0) {
       toolList.innerHTML = "<li>No tools found.</li>";
@@ -301,6 +385,8 @@ async function loadToolAccess() {
     }
 
     toolList.innerHTML = "";
+    getMessagesLimitInput = null;
+    getMessagesLimitStatus = null;
 
     // Tools arrive pre-sorted by group then CRUD order from the server.
     // Build grouped structure from tool metadata.
@@ -331,6 +417,9 @@ async function loadToolAccess() {
       }
 
       const li = document.createElement("li");
+      if (tool.name === "getMessages") {
+        li.className = "tool-with-option";
+      }
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.id = "tool-" + tool.name;
@@ -340,7 +429,16 @@ async function loadToolAccess() {
         checkbox.disabled = true;
       }
       checkbox.addEventListener("change", () => {
-        saveToolsStatus.textContent = "";
+        if (tool.name === "getMessages" && getMessagesLimitInput) {
+          getMessagesLimitInput.disabled = !checkbox.checked;
+          if (checkbox.checked) {
+            validateGetMessagesLimitInput();
+          } else {
+            getMessagesLimitInput.removeAttribute("aria-invalid");
+            if (getMessagesLimitStatus) getMessagesLimitStatus.textContent = "";
+          }
+        }
+        onToolChange();
       });
 
       const label = document.createElement("label");
@@ -355,11 +453,43 @@ async function loadToolAccess() {
 
       li.appendChild(checkbox);
       li.appendChild(label);
+      if (tool.name === "getMessages") {
+        const option = document.createElement("div");
+        option.className = "tool-option";
+
+        const limitLabel = document.createElement("label");
+        limitLabel.htmlFor = "getMessagesLimit";
+        limitLabel.textContent = "Max messages per call";
+
+        getMessagesLimitInput = document.createElement("input");
+        getMessagesLimitInput.type = "text";
+        getMessagesLimitInput.inputMode = "numeric";
+        getMessagesLimitInput.id = "getMessagesLimit";
+        getMessagesLimitInput.dataset.min = String(tool.getMessagesLimitMin || data.getMessagesLimitMin || 1);
+        getMessagesLimitInput.dataset.max = String(tool.getMessagesLimitMax || data.getMessagesLimitMax || 20);
+        getMessagesLimitInput.value = String(tool.getMessagesLimit || data.getMessagesLimit || 10);
+        currentGetMessagesLimit = getMessagesLimitInput.value;
+        getMessagesLimitInput.disabled = !checkbox.checked;
+        getMessagesLimitInput.addEventListener("input", () => {
+          validateGetMessagesLimitInput();
+          onToolChange();
+        });
+
+        const rangeNote = document.createElement("span");
+        rangeNote.className = "range-note";
+        rangeNote.textContent = `1-${getMessagesLimitInput.dataset.max}`;
+
+        getMessagesLimitStatus = document.createElement("div");
+        getMessagesLimitStatus.className = "tool-limit-error";
+
+        option.appendChild(limitLabel);
+        option.appendChild(getMessagesLimitInput);
+        option.appendChild(rangeNote);
+        li.appendChild(option);
+        li.appendChild(getMessagesLimitStatus);
+      }
       toolList.appendChild(li);
     }
-
-    saveToolsBtn.disabled = false;
-    saveToolsStatus.textContent = "";
   } catch (e) {
     toolList.innerHTML = "";
     const li = document.createElement("li");
@@ -368,7 +498,20 @@ async function loadToolAccess() {
   }
 }
 
+function onToolChange() {
+  const checkboxes = toolList.querySelectorAll('input[type="checkbox"]');
+  toolAccessChanged = [...checkboxes].some(cb =>
+    !cb.disabled && cb.checked !== !!currentTools.find(tool => tool.name === cb.value)?.enabled
+  );
+  const limitChanged = getMessagesLimitInput && getMessagesLimitInput.value !== currentGetMessagesLimit;
+  toolSettingsChanged = toolAccessChanged || (!currentToolError && !!limitChanged);
+  saveToolsBtn.disabled = !toolSettingsChanged;
+  saveToolsStatus.textContent = currentToolError;
+  saveToolsStatus.className = currentToolError ? "save-status error" : "save-status";
+}
+
 saveToolsBtn.addEventListener("click", async () => {
+  if (!toolSettingsChanged || (currentToolError && !toolAccessChanged)) return;
   saveToolsBtn.disabled = true;
   saveToolsStatus.textContent = "";
   saveToolsStatus.className = "save-status";
@@ -380,9 +523,19 @@ saveToolsBtn.addEventListener("click", async () => {
       disabled.push(cb.value);
     }
   }
+  let getMessagesLimit;
+  if (getMessagesLimitInput) {
+    getMessagesLimit = validateGetMessagesLimitInput();
+    if (getMessagesLimit === null) {
+      saveToolsStatus.textContent = "Fix the highlighted getMessages limit before saving.";
+      saveToolsStatus.className = "save-status error";
+      saveToolsBtn.disabled = false;
+      return;
+    }
+  }
 
   try {
-    const result = await browser.mcpServer.setToolAccess(disabled);
+    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit);
     if (result.error) {
       saveToolsStatus.textContent = result.error;
       saveToolsStatus.className = "save-status error";
@@ -394,8 +547,9 @@ saveToolsBtn.addEventListener("click", async () => {
     saveToolsStatus.textContent = "Error: " + e.message;
     saveToolsStatus.className = "save-status error";
   }
-  saveToolsBtn.disabled = false;
+  saveToolsBtn.disabled = !toolSettingsChanged;
 });
+// END OPTIONS TOOL ACCESS
 
 const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
@@ -432,8 +586,141 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
+const allowFilterSendActionsCheckbox = document.getElementById("allowFilterSendActions");
+const saveFilterSendActionsBtn = document.getElementById("saveFilterSendActionsBtn");
+const saveFilterSendActionsStatus = document.getElementById("saveFilterSendActionsStatus");
+
+async function loadFilterSendActionsPref() {
+  allowFilterSendActionsCheckbox.checked = false;
+  allowFilterSendActionsCheckbox.disabled = true;
+  saveFilterSendActionsBtn.disabled = true;
+  try {
+    const { allowFilterSendActions } = await browser.mcpServer.getAllowFilterSendActions();
+    allowFilterSendActionsCheckbox.checked = allowFilterSendActions === true;
+    allowFilterSendActionsCheckbox.disabled = false;
+    saveFilterSendActionsBtn.disabled = false;
+    saveFilterSendActionsStatus.textContent = "";
+  } catch (e) {
+    saveFilterSendActionsStatus.textContent = "Error loading setting: " + e.message;
+    saveFilterSendActionsStatus.className = "save-status error";
+  }
+}
+
+saveFilterSendActionsBtn.addEventListener("click", async () => {
+  saveFilterSendActionsBtn.disabled = true;
+  saveFilterSendActionsStatus.textContent = "Saving...";
+  saveFilterSendActionsStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setAllowFilterSendActions(allowFilterSendActionsCheckbox.checked);
+    if (result.error) {
+      saveFilterSendActionsStatus.textContent = result.error;
+      saveFilterSendActionsStatus.className = "save-status error";
+    } else {
+      saveFilterSendActionsStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveFilterSendActionsStatus.textContent = "Error: " + e.message;
+    saveFilterSendActionsStatus.className = "save-status error";
+  }
+  saveFilterSendActionsBtn.disabled = false;
+});
+// BEGIN OPTIONS PRIVACY SETTINGS
+const allowEncryptedMessagesCheckbox = document.getElementById("allowEncryptedMessages");
+const allowAllCalendarsCheckbox = document.getElementById("allowAllCalendars");
+const allowAllAddressBooksCheckbox = document.getElementById("allowAllAddressBooks");
+const savePrivacyBtn = document.getElementById("savePrivacyBtn");
+const savePrivacyStatus = document.getElementById("savePrivacyStatus");
+
+async function loadPrivacySettings() {
+  try {
+    const settings = await browser.mcpServer.getPrivacySettings();
+    if (settings.error) throw new Error(settings.error);
+    allowEncryptedMessagesCheckbox.checked = settings.allowEncryptedMessages === true;
+    allowAllCalendarsCheckbox.checked = settings.allowAllCalendars === true;
+    allowAllAddressBooksCheckbox.checked = settings.allowAllAddressBooks === true;
+    savePrivacyBtn.disabled = false;
+    savePrivacyStatus.textContent = "";
+    savePrivacyStatus.className = "save-status";
+  } catch (e) {
+    savePrivacyStatus.textContent = "Error loading settings: " + e.message;
+    savePrivacyStatus.className = "save-status error";
+  }
+}
+
+savePrivacyBtn.addEventListener("click", async () => {
+  savePrivacyBtn.disabled = true;
+  savePrivacyStatus.textContent = "Saving...";
+  savePrivacyStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setPrivacySettings(
+      allowEncryptedMessagesCheckbox.checked,
+      allowAllCalendarsCheckbox.checked,
+      allowAllAddressBooksCheckbox.checked
+    );
+    if (result.error) {
+      savePrivacyStatus.textContent = result.error;
+      savePrivacyStatus.className = "save-status error";
+    } else {
+      savePrivacyStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    savePrivacyStatus.textContent = "Error: " + e.message;
+    savePrivacyStatus.className = "save-status error";
+  }
+  savePrivacyBtn.disabled = false;
+});
+// END OPTIONS PRIVACY SETTINGS
+
 loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
 loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", "loadAuthenticationConfig failed:", e));
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadFilterSendActionsPref().catch(e => console.error("thunderbird-mcp options:", "loadFilterSendActionsPref failed:", e));
+loadPrivacySettings().catch(e => console.error("thunderbird-mcp options:", "loadPrivacySettings failed:", e));
+
+const listenAllCheckbox = document.getElementById("listenAll");
+const listenAllWarning = document.getElementById("listenAllWarning");
+const saveListenAllBtn = document.getElementById("saveListenAllBtn");
+const saveListenAllStatus = document.getElementById("saveListenAllStatus");
+
+async function loadListenAllPref() {
+  try {
+    const { listenAll } = await browser.mcpServer.getListenAll();
+    listenAllCheckbox.checked = !!listenAll;
+    listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
+    saveListenAllBtn.disabled = false;
+    saveListenAllStatus.textContent = "";
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error loading setting: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+}
+
+listenAllCheckbox.addEventListener("change", () => {
+  listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
+});
+
+// BEGIN OPTIONS LISTEN ALL SAVE
+saveListenAllBtn.addEventListener("click", async () => {
+  saveListenAllBtn.disabled = true;
+  saveListenAllStatus.textContent = "Saving...";
+  saveListenAllStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setListenAll(listenAllCheckbox.checked);
+    if (result.error) {
+      saveListenAllStatus.textContent = result.error;
+      saveListenAllStatus.className = "save-status error";
+    } else {
+      saveListenAllStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+  await loadServerInfo();
+  saveListenAllBtn.disabled = false;
+});
+// END OPTIONS LISTEN ALL SAVE
+
+loadListenAllPref();

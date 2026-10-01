@@ -12,7 +12,6 @@ const path = require('path');
 const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
-const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
@@ -20,7 +19,18 @@ const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
+const SNAP_TMP_SUBDIR = ['Downloads', 'thunderbird.tmp'];
 const CONNECTION_FILE_BASENAME = 'connection.json';
+const MAX_CONNECTION_FILE_BYTES = 4096;
+// Known upstream (including legacy and ESR), Fedora, and Betterbird IDs.
+// Keep exact case: Flatpak application IDs are case-sensitive.
+const FLATPAK_APP_IDS = new Set([
+  'org.mozilla.Thunderbird',
+  'org.mozilla.thunderbird',
+  'org.mozilla.thunderbird_esr',
+  'net.thunderbird.Thunderbird',
+  'eu.betterbird.Betterbird',
+]);
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
 // MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
@@ -174,7 +184,7 @@ function buildScanGroup(label, pattern, candidates, noMatchReason) {
 }
 
 function findMacOsConnectionCandidates(context) {
-  const { fsImpl, pathImpl, darwinFoldersRoot, uid } = context;
+  const { fsImpl, pathImpl, darwinFoldersRoot } = context;
   const pattern = pathImpl.join(
     darwinFoldersRoot,
     '*',
@@ -225,12 +235,7 @@ function findMacOsConnectionCandidates(context) {
 
       try {
         const stat = fsImpl.statSync(candidatePath);
-        if (!stat.isFile()) {
-          continue;
-        }
-        if (uid !== null && uid !== undefined && stat.uid !== uid) {
-          continue;
-        }
+        // Scan metadata only; the opened descriptor decides trust below.
         addUniqueCandidate(candidates, seenPaths, makeCandidate('macOS temp scan', candidatePath, stat.mtimeMs));
       } catch (err) {
         if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
@@ -240,11 +245,7 @@ function findMacOsConnectionCandidates(context) {
     }
   }
 
-  const ownerText = uid !== null && uid !== undefined
-    ? `no matching files owned by uid ${uid}`
-    : 'no matching files';
-
-  return buildScanGroup('macOS temp scan', pattern, candidates, ownerText);
+  return buildScanGroup('macOS temp scan', pattern, candidates, 'no matching files');
 }
 
 function findSnapConnectionCandidates(context) {
@@ -285,6 +286,10 @@ function findSnapConnectionCandidates(context) {
           continue;
         }
 
+        // argv[0] and TMPDIR are process-controlled; require the actual Snap executable.
+        const executable = fsImpl.realpathSync(pathImpl.join(procRoot, pid, 'exe'));
+        if (!executable.startsWith('/snap/thunderbird/')) continue;
+
         const environ = fsImpl.readFileSync(pathImpl.join(procRoot, pid, 'environ'), 'utf8');
         const tmpEntry = environ.split('\0').find((entry) => entry.startsWith('TMPDIR='));
         if (!tmpEntry) {
@@ -319,8 +324,7 @@ function findSnapConnectionCandidates(context) {
   // cannot tell us the runtime TMPDIR.
   const fallbackPath = pathImpl.join(
     homeDir,
-    'Downloads',
-    'thunderbird.tmp',
+    ...SNAP_TMP_SUBDIR,
     THUNDERBIRD_MCP_SUBDIR,
     CONNECTION_FILE_BASENAME
   );
@@ -339,64 +343,90 @@ function findSnapConnectionCandidates(context) {
   return buildScanGroup('Snap detection', pattern, candidates, 'no thunderbird TMPDIR candidates found');
 }
 
+// Shared layout definitions for discovery and attachment export recognition.
+function getFlatpakScanRoots(context) {
+  const { pathImpl, runtimeDir, homeDir } = context;
+  return [
+    {
+      base: runtimeDir,
+      label: '$XDG_RUNTIME_DIR',
+      appRoot: pathImpl.join(runtimeDir || '$XDG_RUNTIME_DIR', 'app'),
+      tmpSuffix: [],
+    },
+    {
+      base: homeDir,
+      label: '$HOME',
+      appRoot: pathImpl.join(homeDir || '$HOME', '.var', 'app'),
+      tmpSuffix: ['cache', 'tmp'],
+    },
+  ];
+}
+
 function findFlatpakConnectionCandidates(context) {
-  const { fsImpl, pathImpl, runtimeDir } = context;
-  const patternBase = runtimeDir || '$XDG_RUNTIME_DIR';
-  const pattern = pathImpl.join(
-    patternBase,
-    'app',
-    '*',
-    THUNDERBIRD_MCP_SUBDIR,
-    CONNECTION_FILE_BASENAME
-  );
+  const { fsImpl, pathImpl } = context;
+  const roots = getFlatpakScanRoots(context);
 
-  if (!runtimeDir) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, 'runtime dir unavailable')],
-      candidates: [],
-    };
-  }
-
-  const appRoot = pathImpl.join(runtimeDir, 'app');
-  let appEntries;
-  try {
-    appEntries = fsImpl.readdirSync(appRoot, { withFileTypes: true });
-  } catch (err) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, normalizeFsError(err))],
-      candidates: [],
-    };
-  }
-
+  const notes = [];
   const candidates = [];
   const seenPaths = new Set();
 
-  for (const appEntry of appEntries) {
-    if (!appEntry.isDirectory()) {
-      continue;
-    }
-
-    const candidatePath = pathImpl.join(
-      appRoot,
-      appEntry.name,
+  for (const root of roots) {
+    const pattern = pathImpl.join(
+      root.appRoot,
+      '*',
+      ...root.tmpSuffix,
       THUNDERBIRD_MCP_SUBDIR,
       CONNECTION_FILE_BASENAME
     );
 
+    if (!root.base) {
+      notes.push(makeAttempt('Flatpak scan', pattern, `${root.label} unavailable`));
+      continue;
+    }
+
+    let appEntries;
     try {
-      const stat = fsImpl.statSync(candidatePath);
-      if (!stat.isFile()) {
-        continue;
-      }
-      addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak runtime scan', candidatePath, stat.mtimeMs));
+      appEntries = fsImpl.readdirSync(root.appRoot, { withFileTypes: true });
     } catch (err) {
-      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
+      notes.push(makeAttempt('Flatpak scan', pattern, normalizeFsError(err)));
+      continue;
+    }
+
+    let found = 0;
+    for (const appEntry of appEntries) {
+      // Skip symlinked aliases (e.g. org.mozilla.Thunderbird -> net.thunderbird.Thunderbird)
+      if (!appEntry.isDirectory()) {
         continue;
       }
+      if (!FLATPAK_APP_IDS.has(appEntry.name)) {
+        notes.push(makeAttempt('Flatpak scan', pathImpl.join(root.appRoot, appEntry.name), 'application ID not allowed'));
+        continue;
+      }
+
+      const candidatePath = pathImpl.join(
+        root.appRoot,
+        appEntry.name,
+        ...root.tmpSuffix,
+        THUNDERBIRD_MCP_SUBDIR,
+        CONNECTION_FILE_BASENAME
+      );
+
+      try {
+        const stat = fsImpl.statSync(candidatePath);
+        // Scan metadata only; the opened descriptor decides trust below.
+        addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak scan', candidatePath, stat.mtimeMs));
+        found++;
+      } catch {
+        // ENOENT/ENOTDIR are expected for non-Thunderbird apps; skip anything else too.
+      }
+    }
+
+    if (found === 0) {
+      notes.push(makeAttempt('Flatpak scan', pattern, 'no matching files'));
     }
   }
 
-  return buildScanGroup('Flatpak scan', pattern, candidates, 'no matching files');
+  return { notes, candidates: sortCandidatesByMtime(candidates) };
 }
 
 function buildCandidateGroups(options = {}) {
@@ -438,25 +468,56 @@ function buildCandidateGroups(options = {}) {
 }
 
 function tryReadConnectionCandidate(candidate, context) {
+  const { fsImpl, platform, uid } = context;
+  let fd;
   try {
-    const raw = context.fsImpl.readFileSync(candidate.path, 'utf8');
+    const constants = fsImpl.constants || fs.constants;
+    if (platform !== 'win32' && (!constants.O_NOFOLLOW || !constants.O_NONBLOCK)) {
+      throw new Error('secure connection file open flags unavailable');
+    }
+    // Open once: no path-based read after checking ownership/type. NONBLOCK
+    // lets fstat reject a FIFO without waiting for a writer to connect.
+    fd = fsImpl.openSync(candidate.path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    const stat = fsImpl.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('connection file is not a regular file');
+    if (platform !== 'win32') {
+      if (!Number.isInteger(uid) || stat.uid !== uid) {
+        throw new Error('connection file is not owned by the current user');
+      }
+      if ((stat.mode & 0o077) !== 0) {
+        throw new Error('connection file permissions must be owner-only (0600)');
+      }
+    }
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_CONNECTION_FILE_BYTES) {
+      throw new Error(`connection file exceeds ${MAX_CONNECTION_FILE_BYTES} bytes or has an invalid size`);
+    }
+    // Bound the read as well as fstat: the file may grow after it was checked.
+    const buffer = Buffer.alloc(MAX_CONNECTION_FILE_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = fsImpl.readSync(fd, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > MAX_CONNECTION_FILE_BYTES) {
+      throw new Error(`connection file exceeds ${MAX_CONNECTION_FILE_BYTES} bytes`);
+    }
     let data;
     try {
-      data = JSON.parse(raw);
-    } catch (err) {
-      return {
-        ok: false,
-        attempt: makeAttempt(candidate.label, candidate.path, `malformed JSON (${err.message})`)
-      };
+      data = JSON.parse(buffer.toString('utf8', 0, length));
+    } catch {
+      throw new Error('malformed JSON in connection file');
     }
-
-    if (!data.port || !data.token) {
-      return {
-        ok: false,
-        attempt: makeAttempt(candidate.label, candidate.path, 'missing port or token')
-      };
+    if (!data || !data.port || !data.token) {
+      throw new Error('Invalid connection file: missing port or token');
     }
-
+    if (!Number.isInteger(data.port) || data.port < 1 || data.port > 65535) {
+      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
+    }
+    if (!isValidAuthToken(data.token)) {
+      throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
+    }
     return {
       ok: true,
       data,
@@ -467,6 +528,8 @@ function tryReadConnectionCandidate(candidate, context) {
       ok: false,
       attempt: makeAttempt(candidate.label, candidate.path, normalizeFsError(err))
     };
+  } finally {
+    if (fd !== undefined) fsImpl.closeSync(fd);
   }
 }
 
@@ -496,6 +559,409 @@ function discoverConnectionInfo(options = {}) {
   }
 
   return { candidates, attempts };
+}
+
+// Max raw bytes for an attachment read from a path before base64 encoding.
+// Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
+// extension's 25 MB MAX_BASE64_SIZE limit.
+const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+// Keep these message-wide limits in sync with extension/mcp_server/api.js.
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+
+// File paths that an MCP caller must never be allowed to attach to outbound
+// mail. Keep the pattern list and helper behavior identical to the extension so
+// neither transport can bypass the LLM-confused-deputy defense.
+// Keep in sync with extension/mcp_server/api.js isSensitiveFilePath.
+const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // Network/device namespaces must be rejected before any filesystem access.
+  /^\/\//,
+  // macOS user Library remains denied even when used as a temp directory.
+  /^\/users\/[^/]+\/library(\/|$)/,
+  /\/thunderbird-mcp\/(?:[^/]+\/)?connection\.json$/,
+  // Credential names also occur outside the usual profile directories.
+  /(^|\/)id_[^/]+$/,
+  /(^|\/)private[-_ ]?keys?(\.[^/]+)?$/,
+  /\.(keychain|keychain-db)$/,
+  /(^|\/)(web data|local state|signons\.sqlite|cert[89]\.db|pkcs11\.txt|secmod\.db|prefs\.js|profiles\.ini)$/,
+  // SSH / PGP / cloud / kube / docker credentials
+  /\/\.ssh(\/|$)/,
+  /\/\.gnupg(\/|$)/,
+  /\/\.aws(\/|$)/,
+  /\/\.azure(\/|$)/,
+  /\/\.config\/gcloud(\/|$)/,
+  /\/\.kube(\/|$)/,
+  /\/\.docker(\/|$)/,
+  /\/\.netrc$/,
+  /\/\.npmrc$/,
+  /\/\.pypirc$/,
+  // Common key / secret file extensions anywhere on disk
+  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
+  /\.pem$/,
+  /\.pfx$/,
+  /\.p12$/,
+  /\.kdbx$/,
+  /\.key$/,
+  /\.asc$/,
+  /\.gpg$/,
+  // Linux / macOS system directories
+  /^\/etc\//,
+  /^\/proc\//,
+  /^\/sys\//,
+  /^\/root\//,
+  /^\/var\/log\//,
+  /^\/var\/lib\/sudo\//,
+  // macOS keychain locations
+  /\/library\/keychains\//,
+  // Windows system directories
+  /^[a-z]:\/windows\//,
+  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
+  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
+  // Browser credential stores (Firefox / Chrome / Edge)
+  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
+  // Thunderbird's own profile (contains the user's entire mail store + prefs).
+  // Linux profile directories and profiles.ini live directly under
+  // ~/.thunderbird (or ~/.icedove), while macOS and Windows use the platform
+  // application-data directories below. Block each profile root in full.
+  /\/\.(?:thunderbird|icedove)(\/|$)/,
+  /\/library\/thunderbird(\/|$)/,
+  /\/appdata\/roaming\/thunderbird(\/|$)/,
+];
+
+function getAttachmentExportPathInfo(attachmentPath, exportRoots = [], windows = false) {
+  // Backslashes are literal filename characters on POSIX, not separators.
+  const nativePath = windows ? attachmentPath.replace(/\\/g, '/') : attachmentPath;
+  if (nativePath.startsWith('//') || nativePath.split('/').some(part => part === '.' || part === '..')) return null;
+  // getMessage exports exactly one sanitized message-id directory and one file.
+  // The sibling "attachments" directory is outbound inline staging, not exports.
+  const match = /^(.*\/thunderbird-mcp)\/([a-zA-Z0-9_]+)\/([^/]+)$/.exec(nativePath);
+  if (!match || match[2].toLowerCase() === 'attachments' ||
+      match[3].startsWith('.') || match[3].toLowerCase() === 'connection.json') return null;
+  const roots = typeof exportRoots === 'function' ? exportRoots() : exportRoots;
+  const root = roots.find(candidate => {
+    const nativeRoot = (windows ? candidate.replace(/\\/g, '/') : candidate).replace(/\/$/, '');
+    return windows ? nativeRoot.toLowerCase() === match[1].toLowerCase() : nativeRoot === match[1];
+  });
+  return root ? { root, parts: [match[2], match[3]] } : null;
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
+  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
+  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  if (windows && (normalized.replace(/^[a-z]:/, '').includes(':') ||
+      normalized.split('/').some(part => /[. ]$/.test(part)))) return true;
+  // Traversal must never gain the export-directory exemption.
+  if (normalized.split('/').some(part => part === '.' || part === '..')) return true;
+  if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  // Only inherited dot-directory/AppData restrictions may be waived for exports.
+  if (/(^|\/)(\.[^/]*|appdata)(\/|$)/.test(normalized)) {
+    return !getAttachmentExportPathInfo(attachmentPath, exportRoots, windows);
+  }
+  return false;
+}
+
+// Tools whose `attachments` array may contain string file paths that this
+// bridge resolves on the host filesystem before forwarding. Needed because the
+// Thunderbird snap (and other sandboxed installs) cannot see arbitrary host
+// paths like /data/... or the host's /tmp; passing those paths through to the
+// extension fails when file.exists() returns false inside the sandbox. Reading
+// on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
+
+// Minimal MIME map covering common attachment types (documents, images,
+// archives, A/V). Falls back to application/octet-stream which Thunderbird
+// handles fine.
+const MIME_BY_EXT = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  heic: 'image/heic',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  html: 'text/html',
+  htm: 'text/html',
+  md: 'text/markdown',
+  json: 'application/json',
+  xml: 'application/xml',
+  yml: 'application/yaml',
+  yaml: 'application/yaml',
+  zip: 'application/zip',
+  tar: 'application/x-tar',
+  gz: 'application/gzip',
+  '7z': 'application/x-7z-compressed',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  odp: 'application/vnd.oasis.opendocument.presentation',
+  ics: 'text/calendar',
+  eml: 'message/rfc822',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  m4a: 'audio/mp4',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime'
+};
+
+function guessContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase().replace(/^\./, '');
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+function attachmentError(action, filePath, error) {
+  if (error?.code === 'ENOENT') {
+    return new Error(`Attachment not found: ${filePath}`, { cause: error });
+  }
+  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+    return new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: error });
+  }
+  return new Error(`Attachment ${action} failed (${error?.code || 'unknown'}): ${filePath}`, { cause: error });
+}
+
+function validateAttachmentStat(filePath, stat) {
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+    throw new Error(`Attachment has an invalid file size: ${filePath}`);
+  }
+  if (stat.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `Attachment too large: ${filePath} is ${stat.size} bytes ` +
+      `(limit ${MAX_ATTACHMENT_BYTES} bytes / ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB raw before base64)`
+    );
+  }
+}
+
+// Recognize only Thunderbird temp roots, never a root supplied in tool arguments.
+function getAttachmentExportRoots(context) {
+  const { pathImpl, homeDir, platform } = context;
+  const roots = [pathImpl.dirname(getDefaultConnectionFile(context))];
+  if (platform === 'linux') {
+    if (homeDir) roots.push(pathImpl.join(homeDir, ...SNAP_TMP_SUBDIR, THUNDERBIRD_MCP_SUBDIR));
+    for (const root of getFlatpakScanRoots(context)) {
+      if (!root.base) continue;
+      for (const appId of FLATPAK_APP_IDS) {
+        roots.push(pathImpl.join(root.appRoot, appId, ...root.tmpSuffix, THUNDERBIRD_MCP_SUBDIR));
+      }
+    }
+  }
+  // Resolve only the trusted temp root. A redirect below it (including the
+  // thunderbird-mcp directory itself) must not become a trusted export root.
+  const canonicalRoots = roots.flatMap(root => {
+    try {
+      return [pathImpl.join(context.fsImpl.realpathSync(pathImpl.dirname(root)), THUNDERBIRD_MCP_SUBDIR)];
+    } catch {
+      return []; // An unavailable temp layout cannot provide an exemption.
+    }
+  });
+  return [...new Set([...roots, ...canonicalRoots])];
+}
+
+async function inspectAttachmentPath(filePath, context) {
+  const { fsImpl, pathImpl, attachmentPolicy } = context;
+  // Check both the supplied path and its lexical normalization before any
+  // filesystem access. The latter catches paths such as /tmp/../etc/passwd.
+  if (isSensitiveFilePath(filePath, attachmentPolicy) || isSensitiveFilePath(pathImpl.resolve(filePath), attachmentPolicy)) {
+    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
+  }
+
+  let stat;
+  try {
+    // lstat is deliberate: stat would follow the final symlink before policy
+    // could reject it.
+    stat = await fsImpl.promises.lstat(filePath);
+  } catch (e) {
+    throw attachmentError('lstat', filePath, e);
+  }
+  validateAttachmentStat(filePath, stat);
+  let realPath;
+  try {
+    realPath = fsImpl.realpathSync(filePath);
+  } catch (e) {
+    throw attachmentError('realpath', filePath, e);
+  }
+  if (isSensitiveFilePath(realPath, attachmentPolicy)) {
+    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
+  }
+  const exportInfo = getAttachmentExportPathInfo(filePath, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+  const resolvedExportInfo = getAttachmentExportPathInfo(realPath, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+  if (exportInfo || resolvedExportInfo) {
+    let expectedPath = pathImpl.resolve(filePath);
+    if (exportInfo) {
+      const canonicalTempRoot = fsImpl.realpathSync(pathImpl.dirname(exportInfo.root));
+      expectedPath = pathImpl.join(canonicalTempRoot, THUNDERBIRD_MCP_SUBDIR, ...exportInfo.parts);
+    }
+    if (pathImpl.relative(expectedPath, realPath) !== '') {
+      throw new Error(`Attachment export path is redirected: ${filePath}`);
+    }
+  }
+  return { filePath, realPath, stat, isExport: !!(exportInfo || resolvedExportInfo) };
+}
+
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readFileHandleExactly(handle, filePath, size) {
+  const buffer = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+    if (bytesRead === 0) {
+      throw new Error(`Attachment changed while being read: ${filePath}`);
+    }
+    offset += bytesRead;
+  }
+
+  // Do not let a file that grew after fstat trigger an unbounded read.
+  const extra = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(extra, 0, 1, size);
+  if (bytesRead !== 0) {
+    throw new Error(`Attachment changed while being read: ${filePath}`);
+  }
+
+  return buffer;
+}
+
+// Read a preflighted file path off the host filesystem and convert it to the
+// inline { name, contentType, base64 } shape the extension supports. Opening
+// with O_NOFOLLOW where available and comparing the opened file to the lstat
+// snapshot prevents a path swap from redirecting the read to a symlink/other
+// inode between policy validation and I/O.
+async function readAttachmentFromPath(fileInfo, context) {
+  const { fsImpl, pathImpl, platform, procRoot, attachmentPolicy } = context;
+  const { filePath, stat: preflightStat } = fileInfo;
+  const freshInfo = await inspectAttachmentPath(filePath, context);
+  if (fileInfo.realPath !== freshInfo.realPath || !sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
+    throw new Error(`Attachment changed after validation: ${filePath}`);
+  }
+
+  const constants = fsImpl.constants || fs.constants;
+  const noFollow = constants.O_NOFOLLOW || 0;
+  let handle;
+  try {
+    handle = await fsImpl.promises.open(freshInfo.realPath, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK || 0));
+  } catch (e) {
+    if (e?.code === 'ELOOP') {
+      throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`, { cause: e });
+    }
+    throw attachmentError('open', filePath, e);
+  }
+
+  try {
+    let openedStat;
+    try {
+      openedStat = await handle.stat();
+    } catch (e) {
+      throw attachmentError('fstat', filePath, e);
+    }
+    validateAttachmentStat(filePath, openedStat);
+    if (!sameFile(freshInfo.stat, openedStat) || freshInfo.stat.size !== openedStat.size) {
+      throw new Error(`Attachment changed after validation: ${filePath}`);
+    }
+    if (platform === 'linux') {
+      let openedPath;
+      try {
+        openedPath = fsImpl.readlinkSync(pathImpl.join(procRoot, 'self', 'fd', String(handle.fd)));
+      } catch (e) {
+        throw attachmentError('resolve opened file', filePath, e);
+      }
+      if (!pathImpl.isAbsolute(openedPath) || openedPath.endsWith(' (deleted)') ||
+          isSensitiveFilePath(openedPath, attachmentPolicy)) {
+        throw new Error(`Sensitive or unresolved opened attachment path blocked: ${filePath}`);
+      }
+      if ((freshInfo.isExport ||
+           getAttachmentExportPathInfo(openedPath, attachmentPolicy.exportRoots, attachmentPolicy.windows)) &&
+          pathImpl.relative(freshInfo.realPath, openedPath) !== '') {
+        throw new Error(`Attachment export path is redirected: ${filePath}`);
+      }
+    }
+    const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
+    return {
+      name: path.basename(filePath),
+      contentType: guessContentType(filePath),
+      base64: buffer.toString('base64')
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+// Replace every string entry in `args.attachments` (= file path) with an
+// inline { name, contentType, base64 } object read off the host filesystem.
+// Inline objects pass through unchanged. All paths and message-wide limits are
+// preflighted before the first read, then files are read sequentially so a
+// caller cannot force many large buffers to be resident at once.
+async function inlineAttachmentPaths(args, options = {}) {
+  if (!args || args.attachments === undefined || args.attachments === null) return;
+  if (!Array.isArray(args.attachments)) {
+    throw new Error('attachments must be an array, not a JSON-encoded string or another value');
+  }
+  const context = createDiscoveryContext(options);
+  let exportRoots;
+  context.attachmentPolicy = {
+    windows: context.platform === 'win32',
+    // Resolve trusted roots only after lexical network/credential checks pass.
+    exportRoots: () => (exportRoots ||= getAttachmentExportRoots(context)),
+  };
+
+  if (args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    throw new Error(
+      `Attachment count ${args.attachments.length} exceeds the ` +
+      `${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
+    );
+  }
+
+  const fileInfoByIndex = new Map();
+  const refused = [];
+  let totalAttachmentBytes = 0;
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    if (typeof entry !== 'string') continue;
+
+    try {
+      const fileInfo = await inspectAttachmentPath(entry, context);
+      if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+        throw new Error(
+          `Attachment aggregate too large at ${entry}: exceeds the ` +
+          `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
+        );
+      }
+      totalAttachmentBytes += fileInfo.stat.size;
+      fileInfoByIndex.set(index, fileInfo);
+    } catch (error) {
+      refused.push(error.message);
+    }
+  }
+  if (refused.length) throw new Error(`Attachments refused: ${refused.join('; ')}`);
+
+  const resolved = [];
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    resolved.push(
+      typeof entry === 'string'
+        ? await readAttachmentFromPath(fileInfoByIndex.get(index), context)
+        : entry
+    );
+  }
+  args.attachments = resolved;
 }
 
 /**
@@ -558,17 +1024,23 @@ function formatDiscoveryAttempts(attempts = lastDiscoveryAttempts) {
     .join('; ');
 }
 
+const ADDON_DISABLED_HINT = 'The add-on may be disabled in Thunderbird; see README: https://github.com/TKasperczyk/thunderbird-mcp#release-channel-and-experiment-api-add-ons';
+
 function buildConnectionDiscoveryErrorMessage() {
   return (
     'Connection discovery failed. ' +
     'Tried: ' + formatDiscoveryAttempts() + '. ' +
     'Is Thunderbird running with the MCP extension? ' +
-    'The extension must be started first to create the connection file.'
+    'The extension must be started first to create the connection file.\n' +
+    ADDON_DISABLED_HINT
   );
 }
 
 function sanitizeJson(data) {
-  // Remove control chars except \n, \r, \t
+  // Remove control chars except \n, \r, \t. The character class is
+  // intentional -- some clients emit stray control bytes and we
+  // sanitize them out before JSON.parse() chokes on them.
+  // eslint-disable-next-line no-control-regex
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Escape raw newlines/carriage returns/tabs that aren't already escaped.
   // Match an even number of backslashes (including zero) before the control
@@ -627,11 +1099,76 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
+  // For mail tools (including drafts), inline attachments passed as file paths.
+  // The Thunderbird extension may run inside a sandboxed snap that cannot
+  // see /data/..., the host /tmp, or any path outside its confined view —
+  // passing such paths through would fail attachment validation.
+  // Reading on the bridge side and shipping base64 sidesteps the sandbox.
+  if (message.method === 'tools/call'
+      && message.params
+      && ATTACHMENT_TOOLS.has(message.params.name)) {
+    try {
+      await inlineAttachmentPaths(message.params.arguments);
+    } catch (e) {
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: e.message }
+      };
+    }
+  }
+
   return forwardToThunderbird(message);
 }
 
-function tryRequest(hostname, postData, port, token) {
+// BEGIN BRIDGE HTTP REQUEST HELPERS
+const REQUEST_TIMEOUT = 30000;
+const MAIL_OPERATION_TIMEOUT = 150000;
+
+function getThunderbirdRequestPolicy(message) {
+  let checkFolders = null;
+  if (message?.method === 'tools/call') {
+    const name = message.params?.name;
+    const args = message.params?.arguments;
+    // Match coerceToolArgs in the extension: only the exact string "true"
+    // becomes true before validation and dispatch.
+    const saveAsDraft = args?.saveAsDraft === true || args?.saveAsDraft === 'true';
+    const skipReview = args?.skipReview === true || args?.skipReview === 'true';
+    if (name === 'saveDraft' || (name === 'replyToMessage' && saveAsDraft)) {
+      checkFolders = 'Drafts';
+    } else if (['sendMail', 'replyToMessage', 'forwardMessage'].includes(name) && skipReview) {
+      checkFolders = 'the Sent folder and the Outbox';
+    }
+  }
+  return {
+    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
+    checkFolders,
+  };
+}
+
+function tryRequest(hostname, postData, port, token, policy) {
   return new Promise((resolve, reject) => {
+    let connected = false;
+    let requestStarted = false;
+    let settled = false;
+    const settle = (error, response) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(response);
+    };
+    const connectionFailed = (error) => {
+      // Writes are queued before connecting. A refused connection cannot have
+      // dispatched the operation, but a lost connected socket may have done so
+      // even when the entire request has not finished flushing yet.
+      if (policy.checkFolders && connected && requestStarted) {
+        error = new Error(
+          `${error.message}. The outcome is unknown. Check ${policy.checkFolders} in Thunderbird before retrying.`,
+          { cause: error }
+        );
+      }
+      settle(error);
+    };
     const headers = {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(postData)
@@ -646,35 +1183,47 @@ function tryRequest(hostname, postData, port, token) {
       method: 'POST',
       headers
     }, (res) => {
+      connected = true;
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
+      res.on('error', connectionFailed);
+      res.on('aborted', () => connectionFailed(new Error('Response from Thunderbird was interrupted')));
+      res.on('close', () => {
+        if (!res.complete) connectionFailed(new Error('Response from Thunderbird closed before completion'));
+      });
       res.on('end', () => {
         if (res.statusCode === 403) {
           const err = new Error('Authentication failed (403). Token may be stale.');
           err.statusCode = 403;
-          reject(err);
+          settle(err);
           return;
         }
         const data = Buffer.concat(chunks).toString('utf8');
         try {
-          resolve(JSON.parse(data));
+          settle(null, JSON.parse(data));
         } catch {
           try {
-            resolve(JSON.parse(sanitizeJson(data)));
+            settle(null, JSON.parse(sanitizeJson(data)));
           } catch (e) {
-            reject(new Error(`Invalid JSON from Thunderbird: ${e.message}`));
+            settle(new Error(`Invalid JSON from Thunderbird: ${e.message}`));
           }
         }
       });
     });
 
-    req.on('error', reject);
+    req.on('socket', (socket) => {
+      if (socket.connecting) socket.once('connect', () => { connected = true; });
+      else connected = true;
+    });
+    req.on('error', connectionFailed);
+    req.on('close', () => connectionFailed(new Error('Connection to Thunderbird closed before a complete response')));
 
-    req.setTimeout(REQUEST_TIMEOUT, () => {
+    req.setTimeout(policy.timeoutMs, () => {
+      connectionFailed(new Error(`Request to Thunderbird timed out after ${policy.timeoutMs / 1000} seconds`));
       req.destroy();
-      reject(new Error('Request to Thunderbird timed out'));
     });
 
+    requestStarted = true;
     req.write(postData);
     req.end();
   });
@@ -688,9 +1237,9 @@ function isRetryableConnectionError(err) {
       || err.code === 'EAFNOSUPPORT');
 }
 
-function tryAllHosts(hosts, postData, port, token) {
+function tryAllHosts(hosts, postData, port, token, policy) {
   const tryNext = ([hostname, ...rest]) => {
-    return tryRequest(hostname, postData, port, token).catch((err) => {
+    return tryRequest(hostname, postData, port, token, policy).catch((err) => {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
@@ -699,9 +1248,42 @@ function tryAllHosts(hosts, postData, port, token) {
   };
   return tryNext(hosts);
 }
+// END BRIDGE HTTP REQUEST HELPERS
 
+function compactToolResultJsonText(response) {
+  const content = response?.result?.content;
+  if (!Array.isArray(content)) {
+    return response;
+  }
+
+  let changed = false;
+  const compactedContent = content.map((item) => {
+    if (item?.type !== 'text' || typeof item.text !== 'string') {
+      return item;
+    }
+    try {
+      const compactedText = JSON.stringify(JSON.parse(item.text));
+      if (compactedText === item.text) {
+        return item;
+      }
+      changed = true;
+      return { ...item, text: compactedText };
+    } catch {
+      // Non-JSON text content is already the compact representation.
+      return item;
+    }
+  });
+
+  if (!changed) {
+    return response;
+  }
+  return { ...response, result: { ...response.result, content: compactedContent } };
+}
+
+// BEGIN BRIDGE FORWARDING
 async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
+  const policy = getThunderbirdRequestPolicy(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
   // Fail-closed: if no connection file exists, retry a few times (Thunderbird may
@@ -727,18 +1309,8 @@ async function forwardToThunderbird(message) {
   let rediscoveryAttempted = false;
 
   while (connInfo) {
-    if (!connInfo.port || !connInfo.token) {
-      throw new Error('Invalid connection file: missing port or token');
-    }
-    if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
-      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
-    }
-    if (!isValidAuthToken(connInfo.token)) {
-      throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
-    }
-
     try {
-      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
+      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token, policy);
     } catch (err) {
       if (!isRetryableConnectionError(err)) {
         throw err;
@@ -755,15 +1327,17 @@ async function forwardToThunderbird(message) {
         clearConnectionCache();
         connInfo = readConnectionInfo();
         if (!connInfo) {
-          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?\n${ADDON_DISABLED_HINT}`, { cause: err });
         }
         continue;
       }
 
-      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+      const hint = err.code === 'ECONNREFUSED' ? '\n' + ADDON_DISABLED_HINT : '';
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?${hint}`, { cause: err });
     }
   }
 }
+// END BRIDGE FORWARDING
 
 function startBridge() {
   let pendingRequests = 0;
@@ -809,7 +1383,7 @@ function startBridge() {
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
-          await writeOutput(JSON.stringify(response) + '\n');
+          await writeOutput(JSON.stringify(compactToolResultJsonText(response)) + '\n');
           debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
@@ -858,9 +1432,14 @@ function startBridge() {
   process.on('SIGTERM', () => process.exit(0));
 }
 
-if (require.main === module) {
+// BEGIN BRIDGE STARTUP
+// Desktop clients may load this program with require() from a Node bootstrap,
+// so require.main does not reliably identify a CLI invocation. Test/library
+// consumers must opt out explicitly before requiring the module.
+if (process.env.THUNDERBIRD_MCP_NO_AUTOSTART !== '1') {
   startBridge();
 }
+// END BRIDGE STARTUP
 
 module.exports = {
   advanceToNextCandidate,
@@ -873,7 +1452,15 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  compactToolResultJsonText,
+  inlineAttachmentPaths,
+  isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
+  attachmentLimits: {
+    MAX_ATTACHMENT_BYTES,
+    MAX_TOTAL_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_PER_MESSAGE,
+  },
 };
